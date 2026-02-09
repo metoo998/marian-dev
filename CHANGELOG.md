@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Added --overwrite-checkpoint option that (when set to false) can be used to dump checkpoints with iteration numbers.
 - Implementations of COMET-20 (reference-based) and BLEURT-20 for inference with conversion scripts.
 - `./marian evaluate` sub command for evaluation with COMET-QE-20, COMET-20 and BLEURT-20
+- Added `ENABLE_CUBLAS_TF32_TENSOR_OP_MATH` to enable TF32 TensorCore math for float32 GEMMs when supported.
+- Added `ENABLE_CUBLAS_BF16_TENSOR_OP_MATH` and CLI flags `--bf16`/`--tf32` to opt into BF16/TF32 TensorCore math for float32 GEMMs.
+- Added support for `bfloat16` and `tensorfloat32` aliases in `precision` YAML entries to enable BF16/TF32 TensorCore math, preserving original entries under `precision-aliases` when used.
+- Added `--bf16`/`--tf32` shortcuts that map to precision aliases for training and inference.
+- Added `--fp8` precision shortcut and fp8 precision alias handling gated behind USE_CUBLASLT_FP8 or USE_TRANSFORMER_ENGINE with CUDA 12+.
 - A bunch of scripts for metrics use and early MBR experiments
 - LSH vocab filtering for GPU. Speed is not competitive with non-LSH. Checking in for completeness and possible future use of LSH on GPU for non-filtering stuff
 - Added --throw-on-divergence and --fp16-fallback-to-fp32 options to detect (fp16 and fp32) and recover (only fp16)

@@ -13,9 +13,47 @@
 
 #include "tensors/gpu/add_all.h"
 
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+#include <transformer_engine/normalization.h>
+#include <transformer_engine/transformer_engine.h>
+#endif
+
 namespace marian {
 
 namespace gpu {
+
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+static bool transformerEngineNormGradEnabled() {
+  static int cached = -1;
+  if(cached == -1) {
+    const char* var = getenv("MARIAN_USE_TE_NORM_GRAD");
+    cached = (var && var[0] == '1') ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+static transformer_engine::DType teDType(Type type) {
+  switch(type) {
+    case Type::float16: return transformer_engine::DType::kFloat16;
+    case Type::float32: return transformer_engine::DType::kFloat32;
+    default: return transformer_engine::DType::kFloat32;
+  }
+}
+
+static void* teDataPtr(Tensor tensor) {
+  switch(tensor->type()) {
+    case Type::float16: return tensor->data<half>();
+    case Type::float32: return tensor->data<float>();
+    default: return tensor->data<float>();
+  }
+}
+
+static int getMultiprocessorCount(int deviceId) {
+  int smCount = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId));
+  return smCount;
+}
+#endif
 
 namespace atomics {
 
@@ -2345,6 +2383,66 @@ __global__ void gLayerNormalizationGrad(T* gradX,
   }
 }
 
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+template <typename T, typename AccType = float>
+__global__ void gLayerNormStats(const T* x, float* mu, float* rsigma, int rows, int cols, AccType eps) {
+  extern __shared__ uint8_t _sharedBytes[];
+  AccType* _shareAccType = (AccType*)_sharedBytes;
+
+  AccType N = cols;
+  for(int bid = 0; bid < rows; bid += gridDim.x) {
+    int j = bid + blockIdx.x;
+    if(j < rows) {
+      const T* xRow = x + j * cols;
+      AccType* _sum = _shareAccType;
+      _sum[threadIdx.x] = (AccType)0.0f;
+      for(int tid = 0; tid < cols; tid += blockDim.x) {
+        int id = tid + threadIdx.x;
+        if(id < cols)
+          _sum[threadIdx.x] += (AccType)xRow[id];
+      }
+      __syncthreads();
+      int len = blockDim.x;
+      while(len != 1) {
+        __syncthreads();
+        int skip = (len + 1) >> 1;
+        if(threadIdx.x < (len >> 1))
+          _sum[threadIdx.x] += _sum[threadIdx.x + skip];
+        len = (len + 1) >> 1;
+      }
+      __syncthreads();
+      AccType mean = _sum[0] / N;
+      __syncthreads();
+
+      AccType* _sqSum = _shareAccType;
+      _sqSum[threadIdx.x] = (AccType)0.0f;
+      for(int tid = 0; tid < cols; tid += blockDim.x) {
+        int id = tid + threadIdx.x;
+        if(id < cols) {
+          AccType diff = (AccType)xRow[id] - mean;
+          _sqSum[threadIdx.x] += diff * diff;
+        }
+      }
+      __syncthreads();
+      len = blockDim.x;
+      while(len != 1) {
+        __syncthreads();
+        int skip = (len + 1) >> 1;
+        if(threadIdx.x < (len >> 1))
+          _sqSum[threadIdx.x] += _sqSum[threadIdx.x + skip];
+        len = (len + 1) >> 1;
+      }
+      __syncthreads();
+      if(threadIdx.x == 0) {
+        mu[j] = (float)mean;
+        rsigma[j] = (float)(1.0f / functional::Ops<AccType>::sqrt(_sqSum[0] / N + eps));
+      }
+    }
+    __syncthreads();
+  }
+}
+#endif
+
 void LayerNormalizationGrad(Ptr<Allocator> allocator,
                             Tensor gradX,
                             Tensor gradGamma,
@@ -2361,6 +2459,54 @@ void LayerNormalizationGrad(Ptr<Allocator> allocator,
 
   int threads = std::min(MAX_THREADS, cols);
   int blocks = std::min(MAX_BLOCKS, rows);
+
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+  if(transformerEngineNormGradEnabled() && gamma && beta && gradGamma && gradBeta
+     && (gradX->type() == Type::float32 || gradX->type() == Type::float16)) {
+    auto muMemory = allocator->alloc(rows * sizeof(float));
+    auto rsigmaMemory = allocator->alloc(rows * sizeof(float));
+    Tensor mu = TensorBase::New(muMemory, Shape({(int)rows}), Type::float32, adj->getBackend());
+    Tensor rsigma = TensorBase::New(rsigmaMemory, Shape({(int)rows}), Type::float32, adj->getBackend());
+
+    int statsShared = sizeof(float) * threads;
+    if(gradX->type() == Type::float32) {
+      gLayerNormStats<float, float><<<blocks, threads, statsShared>>>(
+          x->data<float>(), mu->data<float>(), rsigma->data<float>(), rows, cols, eps);
+#if COMPILE_FP16
+    } else if(gradX->type() == Type::float16) {
+      gLayerNormStats<half, float><<<blocks, threads, statsShared>>>(
+          x->data<half>(), mu->data<float>(), rsigma->data<float>(), rows, cols, eps);
+#endif
+    }
+
+    size_t dataDims[1]{static_cast<size_t>(cols)};
+    size_t statsDims[1]{static_cast<size_t>(rows)};
+    size_t dims2[2]{static_cast<size_t>(rows), static_cast<size_t>(cols)};
+    const NVTEShape dataShape = nvte_make_shape(dataDims, 1);
+    const NVTEShape matrixShape = nvte_make_shape(statsDims, 1);
+    const NVTEShape tensorShape = nvte_make_shape(dims2, 2);
+
+    transformer_engine::TensorWrapper dzWrapper(teDataPtr(adj), tensorShape, teDType(adj->type()));
+    transformer_engine::TensorWrapper xWrapper(teDataPtr(x), tensorShape, teDType(x->type()));
+    transformer_engine::TensorWrapper muWrapper(mu->data(), matrixShape, transformer_engine::DType::kFloat32);
+    transformer_engine::TensorWrapper rsigmaWrapper(rsigma->data(), matrixShape, transformer_engine::DType::kFloat32);
+    transformer_engine::TensorWrapper gammaWrapper(teDataPtr(gamma), dataShape, teDType(gamma->type()));
+    transformer_engine::TensorWrapper dxWrapper(teDataPtr(gradX), tensorShape, teDType(gradX->type()));
+    transformer_engine::TensorWrapper dgammaWrapper(teDataPtr(gradGamma), dataShape, teDType(gradGamma->type()));
+    transformer_engine::TensorWrapper dbetaWrapper(teDataPtr(gradBeta), dataShape, teDType(gradBeta->type()));
+
+    NVTETensor workspace = nvte_create_tensor(NVTE_DELAYED_TENSOR_SCALING);
+    int smCount = getMultiprocessorCount(adj->getDeviceId().no);
+    nvte_layernorm_bwd(dzWrapper.data(), xWrapper.data(), muWrapper.data(), rsigmaWrapper.data(),
+                       gammaWrapper.data(), dxWrapper.data(), dgammaWrapper.data(), dbetaWrapper.data(),
+                       workspace, smCount, false, 0);
+    nvte_destroy_tensor(workspace);
+
+    allocator->free(muMemory);
+    allocator->free(rsigmaMemory);
+    return;
+  }
+#endif
 
   auto tempGradGammaMemory = allocator->alloc(adj->memory()->size());
   Tensor tempGradGamma = TensorBase::New(tempGradGammaMemory, adj->shape(), adj->type(), adj->getBackend());
@@ -2614,6 +2760,43 @@ __global__ void gRMSNormalizationGrad(T* gradX,
   }
 }
 
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+template <typename T, typename AccType = float>
+__global__ void gRMSNormStats(const T* x, float* rsigma, int rows, int cols, AccType eps) {
+  extern __shared__ uint8_t sharedBytes[];
+  AccType* shared = (AccType*)sharedBytes;
+
+  AccType N = cols;
+  for(int bid = 0; bid < rows; bid += gridDim.x) {
+    int j = bid + blockIdx.x;
+    if(j < rows) {
+      const T* xRow = x + j * cols;
+      shared[threadIdx.x] = (AccType)0.0f;
+      for(int tid = 0; tid < cols; tid += blockDim.x) {
+        int id = tid + threadIdx.x;
+        if(id < cols) {
+          AccType xv = (AccType)xRow[id];
+          shared[threadIdx.x] += xv * xv;
+        }
+      }
+      __syncthreads();
+      int len = blockDim.x;
+      while(len != 1) {
+        __syncthreads();
+        int skip = (len + 1) >> 1;
+        if(threadIdx.x < (len >> 1))
+          shared[threadIdx.x] += shared[threadIdx.x + skip];
+        len = (len + 1) >> 1;
+      }
+      __syncthreads();
+      if(threadIdx.x == 0)
+        rsigma[j] = (float)(1.0f / functional::Ops<AccType>::sqrt(shared[0] / N + eps));
+    }
+    __syncthreads();
+  }
+}
+#endif
+
 void RMSNormalizationGrad(Ptr<Allocator> allocator,
                           Tensor gradX,
                           Tensor gradGamma,
@@ -2630,6 +2813,48 @@ void RMSNormalizationGrad(Ptr<Allocator> allocator,
 
   int threads = std::min(MAX_THREADS, cols);
   int blocks = std::min(MAX_BLOCKS, rows);
+
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+  if(transformerEngineNormGradEnabled() && gamma && gradGamma
+     && (gradX->type() == Type::float32 || gradX->type() == Type::float16)) {
+    auto rsigmaMemory = allocator->alloc(rows * sizeof(float));
+    Tensor rsigma = TensorBase::New(rsigmaMemory, Shape({(int)rows}), Type::float32, adj->getBackend());
+
+    int statsShared = sizeof(float) * threads;
+    if(gradX->type() == Type::float32) {
+      gRMSNormStats<float, float><<<blocks, threads, statsShared>>>(
+          x->data<float>(), rsigma->data<float>(), rows, cols, eps);
+#if COMPILE_FP16
+    } else if(gradX->type() == Type::float16) {
+      gRMSNormStats<half, float><<<blocks, threads, statsShared>>>(
+          x->data<half>(), rsigma->data<float>(), rows, cols, eps);
+#endif
+    }
+
+    size_t dataDims[1]{static_cast<size_t>(cols)};
+    size_t statsDims[1]{static_cast<size_t>(rows)};
+    size_t dims2[2]{static_cast<size_t>(rows), static_cast<size_t>(cols)};
+    const NVTEShape dataShape = nvte_make_shape(dataDims, 1);
+    const NVTEShape statsShape = nvte_make_shape(statsDims, 1);
+    const NVTEShape tensorShape = nvte_make_shape(dims2, 2);
+
+    transformer_engine::TensorWrapper dzWrapper(teDataPtr(adj), tensorShape, teDType(adj->type()));
+    transformer_engine::TensorWrapper xWrapper(teDataPtr(x), tensorShape, teDType(x->type()));
+    transformer_engine::TensorWrapper rsigmaWrapper(rsigma->data(), statsShape, transformer_engine::DType::kFloat32);
+    transformer_engine::TensorWrapper gammaWrapper(teDataPtr(gamma), dataShape, teDType(gamma->type()));
+    transformer_engine::TensorWrapper dxWrapper(teDataPtr(gradX), tensorShape, teDType(gradX->type()));
+    transformer_engine::TensorWrapper dgammaWrapper(teDataPtr(gradGamma), dataShape, teDType(gradGamma->type()));
+
+    NVTETensor workspace = nvte_create_tensor(NVTE_DELAYED_TENSOR_SCALING);
+    int smCount = getMultiprocessorCount(adj->getDeviceId().no);
+    nvte_rmsnorm_bwd(dzWrapper.data(), xWrapper.data(), rsigmaWrapper.data(), gammaWrapper.data(),
+                     dxWrapper.data(), dgammaWrapper.data(), workspace, smCount, false, 0);
+    nvte_destroy_tensor(workspace);
+
+    allocator->free(rsigmaMemory);
+    return;
+  }
+#endif
 
   MemoryPiece::PtrType tempGradGammaMemory;
   Tensor tempGradGamma;

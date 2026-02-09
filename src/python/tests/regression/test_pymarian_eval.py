@@ -20,7 +20,7 @@ SEG_DIFF_OK = 0.05
 N_CPUS = max(os.cpu_count() - 2, 2)
 
 USE_GPU = False
-GPU_ARGS = "-d 0 --mini-batch 16"  # --fp16 error margin is too high for bleurt-20
+GPU_ARGS = "-d 0 --mini-batch 16"  # --fp16/--bf16/--tf32 can increase error margins for bleurt-20
 CPU_ARGS = f"--cpu-threads {N_CPUS} --mini-batch 1"
 # NOTE: --mini-batch > 1 on CPU deviates scores https://machinetranslation.visualstudio.com/DefaultCollection/Marian/_git/marian-dev/pullRequest/32883#1707853099
 BACKEND_ARGS = GPU_ARGS if USE_GPU else CPU_ARGS

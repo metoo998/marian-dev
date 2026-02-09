@@ -11,6 +11,7 @@
 #include "common/regex.h"
 #include "common/utils.h"
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -26,8 +27,87 @@
 #if USE_SSL
 #include "common/crypt.h"
 #endif
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+#include <transformer_engine/transformer_engine.h>
+#endif
 
 namespace marian {
+
+namespace {
+
+void setEnvFlag(const char* name, bool enabled) {
+#ifdef _WIN32
+  _putenv_s(name, enabled ? "1" : "0");
+#else
+  setenv(name, enabled ? "1" : "0", 1);
+#endif
+}
+
+void applyPrecisionAliases(YAML::Node& config) {
+  // Keep precision aliases aligned with --fp16 and other precision shortcuts.
+  auto precisionNode = config["precision"];
+  if(!precisionNode || !precisionNode.IsSequence())
+    return;
+
+  std::vector<std::string> originalPrecision;
+  originalPrecision.reserve(precisionNode.size());
+  bool requestFp8 = false;
+  bool requestBf16 = false;
+  bool requestTf32 = false;
+
+  std::vector<std::string> precision;
+  precision.reserve(precisionNode.size());
+  for(const auto& entry : precisionNode) {
+    auto value = entry.as<std::string>();
+    originalPrecision.push_back(value);
+    if(value == "fp8" || value == "fp8_e4m3" || value == "fp8_e5m2") {
+      requestFp8 = true;
+      precision.push_back("float16");
+    } else if(value == "bfloat16") {
+      requestBf16 = true;
+      precision.push_back("float32");
+    } else if(value == "tensorfloat32") {
+      requestTf32 = true;
+      precision.push_back("float32");
+    } else {
+      precision.push_back(value);
+    }
+  }
+
+  if(requestFp8 || requestBf16 || requestTf32)
+    config["precision-aliases"] = originalPrecision;
+
+  if(requestBf16)
+    setEnvFlag("ENABLE_CUBLAS_BF16_TENSOR_OP_MATH", true);
+  if(requestTf32)
+    setEnvFlag("ENABLE_CUBLAS_TF32_TENSOR_OP_MATH", true);
+
+  config["precision"] = precision;
+}
+
+bool hasPrecisionValue(const YAML::Node& config, const std::string& value) {
+  auto precisionNode = config["precision"];
+  if(!precisionNode || !precisionNode.IsSequence())
+    return false;
+  for(const auto& entry : precisionNode) {
+    if(entry.as<std::string>() == value)
+      return true;
+  }
+  return false;
+}
+
+bool hasPrecisionAliasValue(const YAML::Node& config, const std::string& value) {
+  auto precisionNode = config["precision-aliases"];
+  if(!precisionNode || !precisionNode.IsSequence())
+    return false;
+  for(const auto& entry : precisionNode) {
+    if(entry.as<std::string>() == value)
+      return true;
+  }
+  return false;
+}
+
+} // namespace
 
 // TODO: Move this to CLIWrapper and allow to mark options as paths in the same place they are
 // defined
@@ -148,6 +228,10 @@ void ConfigParser::addOptionsGeneral(cli::CLIWrapper& cli) {
     "allow the use of environment variables in paths, of the form ${VAR_NAME}");
   cli.add<bool>("--relative-paths",
     "All paths are relative to the config file location");
+  cli.add<bool>("--tf32",
+    "Enable TF32 TensorCore math for float32 GEMMs (sets ENABLE_CUBLAS_TF32_TENSOR_OP_MATH=1)");
+  cli.add<bool>("--bf16",
+    "Enable BF16 TensorCore math for float32 GEMMs (sets ENABLE_CUBLAS_BF16_TENSOR_OP_MATH=1)");
   cli.add<std::string>("--dump-config",
     "Dump current (modified) configuration to stdout and exit. Possible values: full, minimal, expand")
     ->implicit_val("full");
@@ -614,9 +698,14 @@ void ConfigParser::addOptionsTraining(cli::CLIWrapper& cli) {
   cli.add<bool>("--fp16",
       "Shortcut for mixed precision training with float16 and cost-scaling, "
       "corresponds to: --precision float16 float32 --cost-scaling 8.f 10000 1.f 8.f");
+  cli.add<bool>("--fp8",
+      "Shortcut for mixed precision training with fp8 (requires USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON, CUDA 12+), "
+      "corresponds to: --precision fp8 float32 --cost-scaling 8.f 10000 1.f 8.f");
   cli.add<std::vector<std::string>>("--precision",
       "Mixed precision training for forward/backward pass and optimizaton. "
-      "Defines types for: forward/backward pass, optimization.",
+      "Defines types for: forward/backward pass, optimization. "
+      "Aliases: bfloat16/tensorfloat32 map to float32 with BF16/TF32 TensorCore math; "
+      "fp8/fp8_e4m3/fp8_e5m2 map to float16 and require FP8 support at build time.",
       {"float32", "float32"});
   cli.add<std::vector<std::string>>("--cost-scaling",
       "Dynamic cost scaling for mixed precision training: "
@@ -821,6 +910,9 @@ void ConfigParser::addOptionsTranslation(cli::CLIWrapper& cli) {
 
   cli.add<bool>("--fp16",
       "Shortcut for mixed precision inference with float16, corresponds to: --precision float16");
+  cli.add<bool>("--fp8",
+      "Shortcut for mixed precision inference with fp8 (requires USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON, CUDA 12+), "
+      "corresponds to: --precision fp8");
   cli.add<std::vector<std::string>>("--precision",
       "Mixed precision for inference, set parameter type in expression graph",
       {"float32"});
@@ -947,8 +1039,14 @@ void ConfigParser::addOptionsEmbedding(cli::CLIWrapper& cli) {
 
   cli.add<bool>("--fp16",
       "Shortcut for mixed precision inference with float16, corresponds to: --precision float16");
+  cli.add<bool>("--fp8",
+      "Shortcut for mixed precision inference with fp8 (requires USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON, CUDA 12+), "
+      "corresponds to: --precision fp8");
   cli.add<std::vector<std::string>>("--precision",
-      "Mixed precision for inference, set parameter type in expression graph. Supported values: float32, float16",
+      "Mixed precision for inference, set parameter type in expression graph. "
+      "Supported values: float32, float16. "
+      "Aliases: bfloat16/tensorfloat32 map to float32 with BF16/TF32 TensorCore math; "
+      "fp8/fp8_e4m3/fp8_e5m2 map to float16 and require FP8 support at build time.",
       {"float32"});
 
   cli.add<std::string>("--like",
@@ -1002,8 +1100,14 @@ void ConfigParser::addOptionsEvaluating(cli::CLIWrapper& cli) {
 
   cli.add<bool>("--fp16",
       "Shortcut for mixed precision inference with float16, corresponds to: --precision float16");
+  cli.add<bool>("--fp8",
+      "Shortcut for mixed precision inference with fp8 (requires USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON, CUDA 12+), "
+      "corresponds to: --precision fp8");
   cli.add<std::vector<std::string>>("--precision",
-      "Mixed precision for inference, set parameter type in expression graph. Supported values: float32, float16",
+      "Mixed precision for inference, set parameter type in expression graph. "
+      "Supported values: float32, float16. "
+      "Aliases: bfloat16/tensorfloat32 map to float32 with BF16/TF32 TensorCore math; "
+      "fp8/fp8_e4m3/fp8_e5m2 map to float16 and require FP8 support at build time.",
       {"float32"});
 
   cli.add<std::string>("--like",
@@ -1277,6 +1381,29 @@ Ptr<Options> ConfigParser::parseOptions(int argc, char** argv, bool doValidate) 
   if(get<bool>("interpolate-env-vars")) {
     cli::processPaths(config_, cli::interpolateEnvVars, PATHS);
   }
+
+  if(get<bool>("tf32")) {
+    setEnvFlag("ENABLE_CUBLAS_TF32_TENSOR_OP_MATH", true);
+  }
+  if(get<bool>("bf16")) {
+    setEnvFlag("ENABLE_CUBLAS_BF16_TENSOR_OP_MATH", true);
+  }
+
+  applyPrecisionAliases(config_);
+#if !defined(MARIAN_USE_CUBLASLT_FP8) && !defined(MARIAN_USE_TRANSFORMER_ENGINE)
+  ABORT_IF(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
+               || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2"),
+           "FP8 precision was requested but Marian was not built with FP8 support. "
+           "Rebuild with USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON (CUDA 12+ required).");
+#endif
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+  if(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
+     || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2")) {
+    if(!nvte_is_non_tn_fp8_gemm_supported()) {
+      LOG(warn, "FP8 precision requested, but Transformer Engine reports no supported FP8 GEMM kernels");
+    }
+  }
+#endif
 
   // Option shortcuts for input from STDIN for trainer and scorer
   if(mode_ == cli::mode::training || mode_ == cli::mode::scoring) {
