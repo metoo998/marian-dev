@@ -135,6 +135,7 @@ while IFS=$'\t' read tset pair ref mt; do
         if [[ ! -s $out_file || $REGEN_MARIAN -eq 1 ]]; then
             rm -f $out_file $out_file.log  # cleanup
             log "Generating Marian scores for $mn :: $prefix"
+            # You can replace --fp16 with --bf16 or --tf32 to use TensorCore math on supported GPUs.
             pymarian-eval -d $DEVICES -m $(basename $mn) -s $prefix.src -r $prefix.ref -t $prefix.mt -a skip --fp16 --debug > $out_file 2> $out_file.log || {
                 log "ERROR: Failed to generate scores for $mn"
                 cat $out_file.log

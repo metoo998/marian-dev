@@ -30,6 +30,8 @@ else(APPLE)
 endif(APPLE)
 option(USE_CCACHE "Use ccache compiler cache (https://ccache.dev)" OFF)
 option(USE_CUDNN "Use CUDNN library" OFF)
+option(USE_CUBLASLT_FP8 "Enable cublasLt FP8 support (requires CUDA 12+)" OFF)
+option(USE_TRANSFORMER_ENGINE "Enable NVIDIA Transformer Engine (FP8 kernels)" OFF)
 option(USE_DOXYGEN "Build documentation with Doxygen" ON)
 option(USE_FBGEMM "Use FBGEMM" OFF)
 option(USE_MKL "Compile with MKL support" ON)
@@ -366,8 +368,6 @@ if(USE_OPENSSL)
 endif()
 
 ###############################################################################
-if(COMPILE_CUDA)
-
 if(USE_STATIC_LIBS)
   # link statically to stdlib libraries
   if(NOT MSVC)
@@ -385,6 +385,18 @@ endif()
 
 find_package(CUDA "9.0") # TODO: only enable FP16-related options for compute_70 and higher.
 if(CUDA_FOUND)
+  if(USE_CUBLASLT_FP8)
+    if(CUDA_VERSION VERSION_LESS "12.0")
+      message(FATAL_ERROR "USE_CUBLASLT_FP8 requires CUDA 12.0+")
+    endif()
+    add_definitions(-DMARIAN_USE_CUBLASLT_FP8=1)
+  endif()
+  if(USE_TRANSFORMER_ENGINE)
+    find_package(TransformerEngine REQUIRED)
+    add_definitions(-DMARIAN_USE_TRANSFORMER_ENGINE=1)
+    include_directories(${TRANSFORMER_ENGINE_INCLUDE_DIRS})
+    list(APPEND EXT_LIBS ${TRANSFORMER_ENGINE_LIBRARIES})
+  endif()
   # CUDA >= 10.0 requires CMake >= 3.12.2
   if((CUDA_VERSION VERSION_EQUAL "10.0" OR CUDA_VERSION VERSION_GREATER "10.0") AND (CMAKE_VERSION VERSION_LESS "3.12.2"))
       message(WARNING "On some Unix systems CUDA 10.0+ requires CMake 3.12.2+; you use CMake ${CMAKE_VERSION}")

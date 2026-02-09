@@ -14,6 +14,10 @@
 #if CUDA_VERSION >= 11000
 #include <cublasLt.h>
 #endif
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+#include <transformer_engine/gemm.h>
+#include <transformer_engine/transformer_engine.h>
+#endif
 
 namespace marian {
 
@@ -46,17 +50,68 @@ static bool tensorOpsEnabled(cublasHandle_t cublasHandle) {
 #if CUDA_VERSION >= 9000
   cublasMath_t actual = CUBLAS_DEFAULT_MATH;
   cublasGetMathMode(cublasHandle, &actual);
+#if CUDA_VERSION >= 11000
+  return actual == CUBLAS_TENSOR_OP_MATH || actual == CUBLAS_TF32_TENSOR_OP_MATH;
+#else
   return actual == CUBLAS_TENSOR_OP_MATH;
+#endif
 #else
   return false;
 #endif
 }
 
+static bool tf32TensorOpsRequested() {
+#if CUDA_VERSION >= 11000
+  static int cached = -1;
+  if(cached == -1) {
+    const char* var = getenv("ENABLE_CUBLAS_TF32_TENSOR_OP_MATH");
+    cached = (var && var[0] == '1') ? 1 : 0;
+  }
+  return cached == 1;
+#else
+  return false;
+#endif
+}
+
+static bool bf16TensorOpsRequested() {
+#if CUDA_VERSION >= 11000
+  static int cached = -1;
+  if(cached == -1) {
+    const char* var = getenv("ENABLE_CUBLAS_BF16_TENSOR_OP_MATH");
+    cached = (var && var[0] == '1') ? 1 : 0;
+  }
+  return cached == 1;
+#else
+  return false;
+#endif
+}
+
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+static bool transformerEngineGemmEnabled() {
+  static int cached = -1;
+  if(cached == -1) {
+    const char* var = getenv("MARIAN_USE_TE_GEMM");
+    cached = (var && var[0] == '1') ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+static NVTEShape makeNvteShape(size_t rows, size_t cols) {
+  size_t dims[2]{rows, cols};
+  return nvte_make_shape(dims, 2);
+}
+#endif
+
 static void setTensorMode(cublasHandle_t cublasHandle) {
   cublasHandle; // fool warnings
 #if CUDA_VERSION >= 9000
   static int mode = 0;  // 1: use TC; -1: do not use TC; 0: not set yet
+  static bool useTf32 = false;
+  static bool useBf16 = false;
   if (mode == 0) { // multi-thread note: this is sort-of thread-safe, since multiple threads would determine the same value
+    useBf16 = bf16TensorOpsRequested();
+    useTf32 = !useBf16 && tf32TensorOpsRequested();
+
     const char* var = getenv("ENABLE_CUBLAS_TENSOR_OP_MATH_FP32");
     if (!var)
       var = "1";
@@ -66,18 +121,44 @@ static void setTensorMode(cublasHandle_t cublasHandle) {
       default: ABORT("Invalid ENABLE_CUBLAS_TENSOR_OP_MATH_FP32={}", var);
     }
     if (mode > 0) { // try whether it can be set   --@TODO: check whether this actually works
-      CUBLAS_CHECK(cublasSetMathMode(cublasHandle, CUBLAS_TENSOR_OP_MATH));
+#if CUDA_VERSION >= 11000
+      auto requestedMode = useTf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_TENSOR_OP_MATH;
+#else
+      auto requestedMode = CUBLAS_TENSOR_OP_MATH;
+      useTf32 = false;
+      useBf16 = false;
+#endif
+      CUBLAS_CHECK(cublasSetMathMode(cublasHandle, requestedMode));
       cublasMath_t actual = CUBLAS_DEFAULT_MATH;
       cublasGetMathMode(cublasHandle, &actual);
+#if CUDA_VERSION >= 11000
+      if (actual != requestedMode) {
+        LOG(warn, "[gpu] TensorCores requested but not available");
+        mode = -1;
+      }
+#else
       if (actual != CUBLAS_TENSOR_OP_MATH) {
         LOG(warn, "[gpu] TensorCores requested but not available");
         mode = -1;
       }
+#endif
     }
-    if (mode > 0)
-      LOG(info, "[gpu] 16-bit TensorCores enabled for float32 matrix operations");
+    if (mode > 0) {
+      if(useBf16)
+        LOG(info, "[gpu] BF16 TensorCores enabled for float32 matrix operations");
+      else if(useTf32)
+        LOG(info, "[gpu] TF32 TensorCores enabled for float32 matrix operations");
+      else
+        LOG(info, "[gpu] 16-bit TensorCores enabled for float32 matrix operations");
+    }
   }
+#if CUDA_VERSION >= 11000
+  auto modeValue = mode > 0 ? (useTf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_TENSOR_OP_MATH)
+                            : CUBLAS_DEFAULT_MATH;
+  CUBLAS_CHECK(cublasSetMathMode(cublasHandle, modeValue));
+#else
   CUBLAS_CHECK(cublasSetMathMode(cublasHandle, mode > 0 ? CUBLAS_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
+#endif
 #endif
 }
 
@@ -109,13 +190,54 @@ struct TypedGemm</*ElementType=*/float, /*ComputeType=*/float> { // specializati
   #if CUDA_VERSION > 9000
     // query math mode and set algorithm accordingly
     auto algorithm = tensorOpsEnabled(handle) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
-    if(computeCapability.major >= 5)
+    if(computeCapability.major >= 5) {
+#if defined(MARIAN_USE_TRANSFORMER_ENGINE)
+      if(transformerEngineGemmEnabled()) {
+        cudaStream_t stream = nullptr;
+        CUBLAS_CHECK(cublasGetStream(handle, &stream));
+
+        const size_t aRows = transa == CUBLAS_OP_N ? static_cast<size_t>(m) : static_cast<size_t>(k);
+        const size_t aCols = transa == CUBLAS_OP_N ? static_cast<size_t>(k) : static_cast<size_t>(m);
+        const size_t bRows = transb == CUBLAS_OP_N ? static_cast<size_t>(k) : static_cast<size_t>(n);
+        const size_t bCols = transb == CUBLAS_OP_N ? static_cast<size_t>(n) : static_cast<size_t>(k);
+        const size_t cRows = static_cast<size_t>(m);
+        const size_t cCols = static_cast<size_t>(n);
+
+        const NVTEShape aShape = makeNvteShape(aRows, aCols);
+        const NVTEShape bShape = makeNvteShape(bRows, bCols);
+        const NVTEShape cShape = makeNvteShape(cRows, cCols);
+
+        transformer_engine::TensorWrapper aWrapper(const_cast<float*>(A), aShape,
+                                                    transformer_engine::DType::kFloat32);
+        transformer_engine::TensorWrapper bWrapper(const_cast<float*>(B), bShape,
+                                                    transformer_engine::DType::kFloat32);
+        transformer_engine::TensorWrapper cWrapper(C, cShape, transformer_engine::DType::kFloat32);
+        transformer_engine::TensorWrapper dWrapper(C, cShape, transformer_engine::DType::kFloat32);
+
+        NVTETensor workspace = nvte_create_tensor(NVTE_DELAYED_TENSOR_SCALING);
+        transformer_engine::MatmulConfigWrapper config;
+
+        nvte_cublas_gemm_v2(transa, transb, alpha, aWrapper.data(), bWrapper.data(), beta,
+                            cWrapper.data(), dWrapper.data(), workspace, config, stream);
+
+        nvte_destroy_tensor(workspace);
+        return;
+      }
+#endif
+      cublasComputeType_t computeType = CUBLAS_COMPUTE_32F;
+#if CUDA_VERSION >= 11000
+      if(bf16TensorOpsRequested())
+        computeType = CUBLAS_COMPUTE_32F_FAST_16BF;
+      else if(tf32TensorOpsRequested())
+        computeType = CUBLAS_COMPUTE_32F_FAST_TF32;
+#endif
       CUBLAS_CHECK(cublasGemmEx(handle, transa, transb,
                                 m, n, k, alpha,
                                 A, CUDA_R_32F, lda,
                                 B, CUDA_R_32F, ldb, beta,
                                 C, CUDA_R_32F, ldc,
-                                CUDA_R_32F, algorithm));
+                                computeType, algorithm));
+    }
     else // don't lose the "else"
   #endif
       CUBLAS_CHECK(cublasSgemm(handle, transa, transb,
@@ -590,7 +712,16 @@ static cublasStatus_t cublasLtAffineHelper(cublasLtHandle_t ltHandle, cublasOper
   cublasLtMatmulHeuristicResult_t heuristicResult = {};
 
   cublasLtEpilogue_t epilogue = do_relu? CUBLASLT_EPILOGUE_RELU_BIAS: CUBLASLT_EPILOGUE_BIAS;
-  cublasComputeType_t computeType = matrixType == CUDA_R_32F? CUBLAS_COMPUTE_32F_FAST_16F: CUBLAS_COMPUTE_16F;
+  cublasComputeType_t computeType = matrixType == CUDA_R_32F ? CUBLAS_COMPUTE_32F_FAST_16F
+                                                            : CUBLAS_COMPUTE_16F;
+#if CUDA_VERSION >= 11000
+  if(matrixType == CUDA_R_32F) {
+    if(bf16TensorOpsRequested())
+      computeType = CUBLAS_COMPUTE_32F_FAST_16BF;
+    else if(tf32TensorOpsRequested())
+      computeType = CUBLAS_COMPUTE_32F_FAST_TF32;
+  }
+#endif
 
   // If the bias is not aligned, just matmul and invoke custom epilogue later. 
   // cublas fails with a misalignment error if this condition is not true.

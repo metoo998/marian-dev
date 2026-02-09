@@ -21,6 +21,22 @@ Main features:
 - Permissive open source license (MIT)
 - [more detail...](https://marian-nmt.github.io/features)
 
+## Precision shortcuts
+
+Marian supports mixed-precision shortcuts for training and inference:
+
+```bash
+# fp16 mixed precision (forward/backward in fp16, optimizer in fp32)
+./marian --fp16 ...
+
+# fp8 mixed precision (requires USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON and CUDA 12+)
+./marian --fp8 ...
+
+# TensorCore GEMM math modes for float32 models
+./marian --bf16 ...   # use BF16 TensorCore math when supported
+./marian --tf32 ...   # use TF32 TensorCore math when supported
+```
+
 If you use this, please cite:
 
 Marcin Junczys-Dowmunt, Roman Grundkiewicz, Tomasz Dwojak, Hieu Hoang, Kenneth

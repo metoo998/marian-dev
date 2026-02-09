@@ -1,0 +1,16 @@
+find_path(TRANSFORMER_ENGINE_INCLUDE_DIRS
+  NAMES transformer_engine/transformer_engine.h transformer_engine.h
+  PATHS ENV TRANSFORMER_ENGINE_DIR
+  PATH_SUFFIXES include include/transformer_engine)
+
+find_library(TRANSFORMER_ENGINE_LIBRARIES
+  NAMES transformer_engine transformer_engine_shared
+  PATHS ENV TRANSFORMER_ENGINE_DIR
+  PATH_SUFFIXES lib lib64)
+
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(
+  TransformerEngine
+  REQUIRED_VARS TRANSFORMER_ENGINE_LIBRARIES TRANSFORMER_ENGINE_INCLUDE_DIRS)
+
+mark_as_advanced(TRANSFORMER_ENGINE_LIBRARIES TRANSFORMER_ENGINE_INCLUDE_DIRS)

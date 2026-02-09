@@ -38,6 +38,31 @@ void ConfigParser::addAliases(cli::CLIWrapper& cli) {
     }
   });
 
+  cli.alias("fp8", "true", [&](YAML::Node& config) {
+    if(mode_ == cli::mode::training) {
+      config["precision"] = std::vector<std::string>({"fp8", "float32"});
+      config["cost-scaling"] = std::vector<std::string>({"8.f", "10000", "1.f", "8.f"});
+    } else {
+      config["precision"] = std::vector<std::string>({"fp8"});
+    }
+  });
+
+  cli.alias("bf16", "true", [&](YAML::Node& config) {
+    if(mode_ == cli::mode::training) {
+      config["precision"] = std::vector<std::string>({"bfloat16", "float32"});
+    } else {
+      config["precision"] = std::vector<std::string>({"bfloat16"});
+    }
+  });
+
+  cli.alias("tf32", "true", [&](YAML::Node& config) {
+    if(mode_ == cli::mode::training) {
+      config["precision"] = std::vector<std::string>({"tensorfloat32", "float32"});
+    } else {
+      config["precision"] = std::vector<std::string>({"tensorfloat32"});
+    }
+  });
+
   if(mode_ == cli::mode::training) {
     // for backwards-compatibility with older version, "--no-shuffle" maps to "--shuffle none"
     cli.alias("no-shuffle", "true", [](YAML::Node& config) {
