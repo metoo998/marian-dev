@@ -1389,21 +1389,23 @@ Ptr<Options> ConfigParser::parseOptions(int argc, char** argv, bool doValidate) 
     setEnvFlag("ENABLE_CUBLAS_BF16_TENSOR_OP_MATH", true);
   }
 
-  applyPrecisionAliases(config_);
+  auto applyPrecisionAliasesAndFp8Gating = [&]() {
+    applyPrecisionAliases(config_);
 #if !defined(MARIAN_USE_CUBLASLT_FP8) && !defined(MARIAN_USE_TRANSFORMER_ENGINE)
-  ABORT_IF(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
-               || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2"),
-           "FP8 precision was requested but Marian was not built with FP8 support. "
-           "Rebuild with USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON (CUDA 12+ required).");
+    ABORT_IF(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
+                 || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2"),
+             "FP8 precision was requested but Marian was not built with FP8 support. "
+             "Rebuild with USE_CUBLASLT_FP8=ON or USE_TRANSFORMER_ENGINE=ON (CUDA 12+ required).");
 #endif
 #if defined(MARIAN_USE_TRANSFORMER_ENGINE)
-  if(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
-     || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2")) {
-    if(!nvte_is_non_tn_fp8_gemm_supported()) {
-      LOG(warn, "FP8 precision requested, but Transformer Engine reports no supported FP8 GEMM kernels");
+    if(hasPrecisionValue(config_, "fp8") || hasPrecisionAliasValue(config_, "fp8")
+       || hasPrecisionAliasValue(config_, "fp8_e4m3") || hasPrecisionAliasValue(config_, "fp8_e5m2")) {
+      if(!nvte_is_non_tn_fp8_gemm_supported()) {
+        LOG(warn, "FP8 precision requested, but Transformer Engine reports no supported FP8 GEMM kernels");
+      }
     }
-  }
 #endif
+  };
 
   // Option shortcuts for input from STDIN for trainer and scorer
   if(mode_ == cli::mode::training || mode_ == cli::mode::scoring) {
@@ -1431,6 +1433,8 @@ Ptr<Options> ConfigParser::parseOptions(int argc, char** argv, bool doValidate) 
     if(dumpMode == "expand") {
       cli_.parseAliases();
     }
+
+    applyPrecisionAliasesAndFp8Gating();
 
     if(doValidate) {  // validate before options are dumped and we exit
       ConfigValidator(config_, true).validateOptions(mode_);
@@ -1520,6 +1524,7 @@ Ptr<Options> ConfigParser::parseOptions(int argc, char** argv, bool doValidate) 
 #endif
 
   cli_.parseAliases();
+  applyPrecisionAliasesAndFp8Gating();
   if(doValidate) {  // validate the options after aliases are expanded
     ConfigValidator(config_).validateOptions(mode_);
   }
